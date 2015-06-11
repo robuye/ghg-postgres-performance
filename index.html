@@ -1,0 +1,669 @@
+<!doctype html>
+<html lang="en">	
+<head>
+	<meta charset="utf-8">
+	<title>GHG SQL</title>
+	<link rel="stylesheet" href="css/reveal.min.css">
+	<link rel="stylesheet" href="css/theme/default.css" id="theme">	
+</head>
+
+<body>
+	<div class="reveal">
+		<div class="slides">
+      <section>
+        <h2>Behind Postgres performance</h2>
+				<p> Rob Ulejczyk </p>
+			</section>
+
+      <section>
+        <section>
+          <h2>Setup</h2>
+          <p>I'm using `world` database as always. Get it here:<br/> <a href="http://pgfoundry.org/projects/dbsamples/">http://pgfoundry.org/projects/dbsamples/</a><p>
+          <p>And then:</p>
+          <pre><code>
+psql -d postgres
+create database world;
+\q
+psql -d world -f world.sql
+psql world
+\x auto
+          </code></pre>
+          <p>This is entirely not necessary since the queries and examples I'm going to cover will be very basic.</p>
+        </section>
+        <section>
+          <p>This is entirely not necessary since the queries and examples I'm going to cover will be very basic.</p>
+          <p>I'm running on postgres 9.3 with default settings.</p>
+          <pre><code>
+select version();
+
+     version
+-----------------
+ PostgreSQL 9.3.7
+          </code></pre>
+			  </section>
+			</section>
+      <section>
+        <section>
+          <h2>Cost</h2>
+          <pre><code>
+world=# explain select * from city;
+                       QUERY PLAN
+---------------------------------------------------------
+ Seq Scan on city  (cost=0.00..72.79 rows=4079 width=31)
+          </code></pre>
+          <p>In format of range.</p>
+          <p>First number is startup cost</p>
+          <p>Second number is cost to fetch all rows</p>
+			  </section>
+        <section>
+          <p>Default settings</p>
+          <pre><code>
+# - Planner Cost Constants -
+
+#seq_page_cost = 1.0          # measured on an arbitrary scale
+#random_page_cost = 4.0       # same scale as above
+#cpu_tuple_cost = 0.01        # same scale as above
+#cpu_index_tuple_cost = 0.005 # same scale as above
+#cpu_operator_cost = 0.0025   # same scale as above
+          </code></pre>
+          <p>With SSD disks <code>random_page_cost</code> will be less expensive compared to sequential, adjust it if that's your setup.</p>
+			  </section>
+        <section>
+          <pre><code>Seq Scan on city  (cost=0.00..72.79 rows=4079 width=31)</code></pre>
+          <p>Where did the number came from?</p>
+          <pre><code>
+(disk pages reads * seq_page_cost) + (number of rows * cpu_tuple_cost)
+          </code></pre>
+			  </section>
+        <section>
+          <p>Number of pages and tuples can be found in <code>pg_class</code> table:</p>
+          <pre><code>
+select reltuples, relpages from pg_class where relname = 'city';
+
+ reltuples | relpages 
+-----------+----------
+      4079 |       32
+          </code></pre>
+			  </section>
+        <section>
+          <pre><code>
+Seq Scan on city  (cost=0.00..72.79 rows=4079 width=31)
+          </code></pre>
+          <pre><code>
+(disk pages reads * seq_page_cost) + (number of rows * cpu_tuple_cost)
+          </code></pre>
+          <pre><code>
+(32 * 1) + (4079 * 0.01) = 32 + 40.79 = 72.79
+          </code></pre>
+			  </section>
+        <section>
+          <p>This is as easy as it can be. With even slightly more complicated query that involves index the formula gets different.</p>
+          <pre><code>
+world=# SET enable_seqscan = OFF;
+SET
+world=# explain select * from city where id > 1;
+                                 QUERY PLAN
+----------------------------------------------------------------------------
+ Index Scan using city_pkey on city  (cost=0.28..162.66 rows=4079 width=31)
+   Index Cond: (id > 1)
+(2 rows)
+
+world=# SET enable_seqscan = ON;
+          </code></pre>
+			  </section>
+        <section>
+          <p>Index pages will be read sequentially the pages with real data are read in random order.</p>
+          <p>There is also a predicate that each row needs to be evaluated against.</p>
+          <pre><code>
+number of pages in index (14) * seq_page_cost (1) + 
+tuples (4079) * cpu_index_tuple_cost (0.005) + 
+random_page_cost (4) * number of pages in table (32)
+          </code></pre>
+			  </section>
+        <section>
+          <p>Information about pages and tuples in an index can be found in <code>pg_class</code> just like for normal table:</p>
+          <pre><code>
+world=# select relpages, reltuples from pg_class where relname = 'city_pkey';
+ relpages | reltuples 
+----------+-----------
+       14 |      4079
+          </code></pre>
+          <pre><code>
+ Index Scan using city_pkey on city  (cost=0.28..162.66 rows=4079 width=31)
+          </code></pre>
+          <pre><code>
+            14 + 20.395 + 128 = 162.40
+          </code></pre>
+          <p>(pretty close uff)</p>
+			  </section>
+
+        <section>
+          <p>Proper index use can save time compared to sequential scan.</p>
+          <pre><code>
+world=# explain select * from city where id > 3000;
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Index Scan using city_pkey on city  (cost=0.28..47.15 rows=1078 width=31)
+   Index Cond: (id > 3000)
+          </code></pre>
+			  </section>
+
+        <section>
+          <p>Plans involving subplans may or may not require full scans upfront.</p>
+          <pre><code>
+world=# explain select * from city c
+        inner join country cc on c.countrycode = cc.code;
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Hash Join  (cost=10.38..171.25 rows=4079 width=144)
+   Hash Cond: (c.countrycode = cc.code)
+   ->  Seq Scan on city c  (cost=0.00..104.79 rows=4079 width=31)
+   ->  Hash  (cost=7.39..7.39 rows=239 width=113)
+         ->  Seq Scan on country cc  (cost=0.00..7.39 rows=239 width=113)
+(5 rows)
+          </code></pre>
+          <p>The <code>Hash</code> operation (line 7) requires full Seq Scan upfront (line 8), and startup cost shows it.</p>
+          <p><code>Hash Join</code> (line 4) can probe the <code>country</code> hash as it reads <code>city</code> .</p>
+			  </section>
+
+        <section>
+          <pre><code>
+world=# explain analyze select * from city c 
+          inner join country cc on c.countrycode = cc.code limit 1000;
+                           QUERY PLAN
+--------------------------------------------------------------------------
+ Limit  (cost=10.38..49.82 rows=1000 width=144)
+        (actual time=0.364..2.393 rows=1000 loops=1)
+   ->  Hash Join  (cost=10.38..171.25 rows=4079 width=144)
+                  (actual time=0.362..2.116 rows=1000 loops=1)
+         Hash Cond: (c.countrycode = cc.code)
+         ->  Seq Scan on city c  (cost=0.00..104.79 rows=4079 width=31)
+                                 (actual time=0.010..0.250 rows=1000 loops=1)
+         ->  Hash  (cost=7.39..7.39 rows=239 width=113)
+                   (actual time=0.328..0.328 rows=239 loops=1)
+               Buckets: 1024  Batches: 1  Memory Usage: 36kB
+               ->  Seq Scan on country cc  (cost=0.00..7.39 rows=239 width=113)
+                                           (actual time=0.009..0.123 rows=239 loops=1)
+ Total runtime: 2.617 ms
+          </code></pre>
+			  </section>
+
+        <section>
+          <pre><code>
+world=# explain select * from city c inner join country cc on c.countrycode = cc.code limit 1;
+                                         QUERY PLAN                                          
+---------------------------------------------------------------------------------------------
+ Limit  (cost=0.14..0.35 rows=1 width=144)
+   ->  Nested Loop  (cost=0.14..846.61 rows=4079 width=144)
+         ->  Seq Scan on city c  (cost=0.00..104.79 rows=4079 width=31)
+         ->  Index Scan using country_pkey on country cc  (cost=0.14..0.17 rows=1 width=113)
+               Index Cond: (code = c.countrycode)
+          </code></pre>
+			  </section>
+			</section>
+      <section>
+        <section>
+          <h2>Rows</h2>
+          <pre><code>
+world=# explain select * from city;
+                       QUERY PLAN
+---------------------------------------------------------
+ Seq Scan on city  (cost=0.00..72.79 rows=4079 width=31)
+          </code></pre>
+          <p>Total number of rows can be found in <code>pg_class</code> table.</p>
+			  </section>
+
+        <section>
+          <pre><code>
+world=# explain select * from city where id < 80;
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Index Scan using city_pkey on city  (cost=0.28..9.68 rows=80 width=31)
+   Index Cond: (id < 80)
+          </code></pre>
+          <p>How does Postgres know there is 80 rows with ID less than 80 without scanning the table?</p>
+          <p>Why is it wrong? We know that there is 79 records only.</p>
+			  </section>
+
+        <section>
+          <p>To calculate this number it uses statistics from `pg_stats` table.</p>
+          <pre><code>
+world=# select * from pg_stats where tablename='city' and attname='id';
+
+schemaname             | public
+tablename              | city
+attname                | id
+inherited              | f
+null_frac              | 0
+avg_width              | 4
+n_distinct             | -1
+most_common_vals       | 
+most_common_freqs      | 
+histogram_bounds       | {1,41,82,123,164,204,245,286,327,368,408,449,490,...}
+correlation            | 1
+most_common_elems      | 
+most_common_elem_freqs | 
+elem_count_histogram   | 
+          </code></pre>
+          <p>The important one in this case is `histogram_bounds`.  Histogram divides the data into equal frequency buckets.</p>
+			  </section>
+
+        <section>
+          <pre><code>
+histogram_bounds       | {1,41,82,123,164,204,245,286,327,368,408,449,490,...}
+          </code></pre>
+          <p>QP looks for the bucket that matches our condition.</p>
+          <p>This will be 2nd bucket (41-82) so we know that total number of rows matching the condition will be size of the first bucket + part of the second bucket.</p>
+			  </section>
+
+        <section>
+          <p>Since all the buckets are equal we can calculate the size by dividing total number of tuples by number of buckets.</p>
+          <pre><code>
+4079 / 100 = 40.79
+          </code></pre>
+			  </section>
+
+        <section>
+          <pre><code>
+ Index Scan using city_pkey on city  (cost=0.28..9.68 rows=80 width=31)
+          </code></pre>
+          <p>Now we need to guess number of rows matching our condition in 2nd bucket. Given linear distribution this can be calculated as:</p>
+          <pre><code>
+(80 - 41) / (82 - 41) = 39 / 41 = 0.95121
+          </code></pre>
+          <p>So 95% of items in the bucket met our criteria, that makes:</p>
+          <pre><code>
+40.79 * 0.95121 = 38.80
+          </code></pre>
+          <p>Then add the previous bucket to get the final number:</p>
+          <pre><code>
+40.79 + 38.80 = 79.59 = 80
+          </code></pre>
+			  </section>
+
+        <section>
+          <p>What about not unique values?</p>
+          <pre><code>
+world=# explain select * from city where countrycode = 'USA';
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Seq Scan on city  (cost=0.00..82.99 rows=274 width=31)
+   Filter: (countrycode = 'USA'::bpchar)
+          </code></pre>
+			  </section>
+
+        <section>
+          <p>First let's see the statistics for <code>countrycode</code> column:</p>
+
+          <pre><code>
+world=# select * from pg_stats where tablename='city' and attname='countrycode';
+
+schemaname             | public
+tablename              | city
+attname                | countrycode
+inherited              | f
+null_frac              | 0
+avg_width              | 4
+n_distinct             | 232
+most_common_vals       | {CHN,IND,USA,BRA,JPN,RUS,MEX,PHL,DEU,IDN,GBR,KOR,...}
+most_common_freqs      | {0.0889924,0.0835989,0.0671733,0.0612895,0.0607992,...}
+histogram_bounds       | {ABW,AGO,ARE,ARM,AUS,AUS,AUT,BEL,BEN,BGR,BGR,BLR,...}
+correlation            | 0.668009
+most_common_elems      | 
+most_common_elem_freqs | 
+elem_count_histogram   | 
+          </code></pre>
+			  </section>
+
+        <section>
+          <pre><code>
+most_common_vals       | {CHN,IND,USA,BRA,JPN,RUS,MEX,PHL,DEU,IDN,GBR,KOR,...}
+most_common_freqs      | {0.0889924,0.0835989,0.0671733,0.0612895,0.0607992,...}
+histogram_bounds       | {ABW,AGO,ARE,ARM,AUS,AUS,AUT,BEL,BEN,BGR,BGR,BLR,...}
+          </code></pre>
+          <p>On top of historgram we have <code>most_common_vals</code> and <code>most_common_freqs</code></p>
+          <p>We are looking for <strong>USA</strong> and it's on the list of most common values so:</p>
+          <pre><code>
+4079 * 0.0671733 = 273.99 = 274
+          </code></pre>
+          <pre><code>
+ Seq Scan on city  (cost=0.00..82.99 rows=274 width=31)
+   Filter: (countrycode = 'USA'::bpchar)
+          </code></pre>
+			  </section>
+
+        <section>
+          <p>What if the value is not on the most common list?</p>
+          <pre><code>
+world=# explain select * from city where countrycode = 'BEL';
+                                     QUERY PLAN                                     
+----------------------------------------------------------------------------------
+ Index Scan using idx_city_countrycode on city  (cost=0.28..9.65 rows=4 width=31)
+    Index Cond: (countrycode = 'BEL'::bpchar)
+          </code></pre>
+			  </section>
+
+        <section>
+          <pre><code>
+ Index Scan using idx_city_countrycode on city  (cost=0.28..9.65 rows=4 width=31)
+          </code></pre>
+          <p>Substract frequencies of most common values:</p>
+          <pre><code>
+1 - 0.8141700300000001 = 0.1858299699999999
+          </code></pre>
+          <p>Calculate number of distinct values left:</p>
+          <pre><code>
+232 - 36 = 196
+          </code></pre>
+          <p>Divide these numbers to get friction of all values:</p>
+          <pre><code>
+0.1858299699999999 / 196 = 0.0009481120918367342
+          </code></pre>
+          <p>Multiply it by total number of tuples:</p>
+          <pre><code>
+4079 * 0.0009481120918367342 = 3.86 = 4
+          </code></pre>
+			  </section>
+
+        <section>
+          <p>For non unique columns with range predicates Postgres uses both most frequent values and histogram.</p>
+          <p>These calculations can be found in postgres documentation.</p>
+			  </section>
+
+        <section>
+          <p>What about multiple conditions?</p>
+          <pre><code>
+world=# explain select * from city where id < 80 and countrycode = 'BEL';
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
+ Index Scan using idx_city_countrycode on city  (cost=0.28..9.66 rows=1 width=31)
+   Index Cond: (countrycode = 'BEL'::bpchar)
+   Filter: (id < 80)
+          </code></pre>
+          <p>Query Planner assumes that both conditions are independend so individual estimations can be multiplied:</p>
+          <pre><code>
+0.0009481120918367342 * 0.0195 = 0.07 = 1 (it never returns zero)
+          </code></pre>
+			  </section>
+
+        <section>
+          <p>Statistics are calculated by <code>analyze</code></p>
+          <p>Basic info about vacuum and analyze can be found in <code>pg_stat_all_tables</code></p>
+          <pre><code>
+world=# select last_vacuum, last_autovacuum, last_analyze, last_autoanalyze
+               from pg_stat_all_tables where relname = 'city';
+-[ RECORD 1 ]----+------------------------------
+last_vacuum      | 2015-06-07 17:25:35.239145+02
+last_autovacuum  | 2015-06-07 17:17:55.872564+02
+last_analyze     | 2015-06-07 17:29:42.195939+02
+last_autoanalyze | 2015-06-07 17:17:55.997271+02
+          </code></pre>
+			  </section>
+
+        <section>
+          <p>Statistics are based on random sample of data.</p>
+          <br/>
+          <p>It can be controlled via `default_statistics_target` on system, table and column level.</p>
+          <br/>
+          <p>Target determines the size of histogram and indirectly number of rows taken for sample.</p>
+          <br/>
+          <p>Default is 100, number of rows is `statistics_target * 300`, that gives `30 000` rows.</p>
+			  </section>
+
+        <section>
+If in doubt about where the 300 is coming from it's explained in the source code:
+          <pre><code>
+/*--------------------
+ * The following choice of minrows is based on the paper
+ * "Random sampling for histogram construction: how much is enough?"
+ * by Surajit Chaudhuri, Rajeev Motwani and Vivek Narasayya, in
+ * Proceedings of ACM SIGMOD International Conference on Management
+ * of Data, 1998, Pages 436-447.  Their Corollary 1 to Theorem 5
+ * says that for table size n, histogram size k, maximum relative
+ * error in bin size f, and error probability gamma, the minimum
+ * random sample size is
+ *      r = 4 * k * ln(2*n/gamma) / f^2
+ * Taking f = 0.5, gamma = 0.01, n = 10^6 rows, we obtain
+ *      r = 305.82 * k
+ * Note that because of the log function, the dependence on n is
+ * quite weak; even at n = 10^12, a 300*k sample gives <= 0.66
+ * bin size error with probability 0.99.  So there's no real need to
+ * scale for n, which is a good thing because we don't necessarily
+ * know it at this point.
+ *--------------------
+ */
+          </code></pre>
+			  </section>
+			</section>
+      <section>
+        <section>
+          <h2>Width</h2>
+          <p>Width tells us average size (in bytes) of single tuple in the table.</p>
+          <pre><code>
+ Seq Scan on city  (cost=0.00..72.79 rows=4079 width=31)
+          </code></pre>
+          <p> It's taken from `pg_stats` and is calculated as sum of averages of each column.</p>
+          <pre><code>
+select sum(avg_width) from pg_stats where tablename = 'city';
+ sum 
+-----
+  31
+          </code></pre>
+			  </section>
+
+        <section>
+          <p>Postgres stores data in pages (blocks) each with size of 8 KB (can be changed).</p>
+          <br/>
+          <p>It fetches full pages from the disk, so it can technically fetch multiple tuples with single page read.</p>
+          <br/>
+          <p>This is great if the tuples we are looking for happen to be on the same page, but if we query for 10 tuples that are in different pages it will take 10 expensive reads.</p>
+			  </section>
+
+        <section>
+          <p>With sequential scan being 4 times cheaper than random page reads it's very common that reading everything sequentially will be faster than doing index scan.</p>
+          <p> Indexes are always sorted and are always read sequentially.</p>
+          <pre><code>
+world=# explain select * from city where id > 3000;
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Index Scan using city_pkey on city  (cost=0.28..47.15 rows=1078 width=31)
+   Index Cond: (id > 3000)
+          </code></pre>
+          <p>How can Postgres guess how many random reads will it take?</p>
+			  </section>
+
+        <section>
+          <p>It uses statistics again.</p>
+          <p>The column <code>corelaction</code> for each column describes statistical correlation between physical row ordering and logical ordering of the column values.
+          <pre><code>
+world=# select correlation from pg_stats where tablename='city' and attname='countrycode';
+ correlation 
+-------------
+    0.668009
+          </code></pre>
+          <p>This ranges from -1 to +1.</p>
+          <p>It uses &lt; operator and will be null for columns that don't support this operator.</p>
+			  </section>
+
+        <section>
+          <p>As the value gets closer to +1 or -1 it's more likely the related index will be used, since the tuples are close to each other.</p>
+          <br/>
+          <p>When data is inserted it's generally appended to the end. This works if we mostly read new data.</p>
+          <br/>
+          <p>However when the data is updated it's still actually appended.</p>
+          <br/>
+          <p>This makes updates likely to fragment our data on the disk making it more expensive to read.</p>
+			  </section>
+
+        <section>
+          <p>The table can be reorganised by using <code>CLUSTER</code> command.</p>
+          <br/>
+          <p>This needs to happen manually and locks the table for the duration - you don't want to do it on live table.</p>
+          <pre><code>
+world=# select correlation from pg_stats where tablename='city'
+        and attname='countrycode';
+ correlation 
+-------------
+    0.668009
+          </code></pre>
+          <p><code>CLUSTER</code> requires an index.</p>
+			  </section>
+
+        <section>
+          <pre><code>
+world=# create index idx_city_countrycode on city (countrycode);
+CREATE INDEX
+world=# cluster verbose city using idx_city_countrycode;
+INFO:  clustering "public.city" using index scan on "idx_city_countrycode"
+INFO:  "city": found 0 removable, 4079 nonremovable row versions in 32 pages
+DETAIL:  0 dead row versions cannot be removed yet.
+CPU 0.00s/0.00u sec elapsed 0.04 sec.
+CLUSTER
+world=# select correlation from pg_stats where tablename='city'
+        and attname='countrycode';
+ correlation 
+-------------
+    0.668009
+          </code></pre>
+          <p>No change?</p>
+			  </section>
+
+        <section>
+          <p>Statistics needs to be updated using `analyze`</p>
+          <pre><code>
+world=# analyze city;
+ANALYZE
+world=# select correlation from pg_stats where tablename='city'
+        and attname='countrycode';
+ correlation 
+-------------
+           1
+          </code></pre>
+          <p>Now the data in the table is sorted properly but new/updated tuples will be appended to the end.</p>
+          <br/>
+          <p><code>CLUSTER</code> needs to be run periodically manually to keep the data in right order.</p>
+			  </section>
+
+        <section>
+          <h2>What's the point of width?</h2>
+          <br/>
+          <p>It give's some idea about memory usage.</p>
+			  </section>
+
+        <section>
+          <p>Reading from disk is <strong>really</strong> expensive.</p>
+          <br/>
+          <p>To save expensive reads from the disk Postgres uses `shared buffer cache`.</p>
+          <br/>
+          <p>It's part of memory dedicated to cache requested pages.</p>
+			  </section>
+
+        <section>
+          <p>Shared buffer is almost always full.</p>
+          <br/>
+          <p>When new page is to be stored another page needs to be removed.</p>
+          <br/>
+          <p>Postgres keeps statistics how often the pages are being used and tries his best to evict the right pages (we don't have control over it).</p>
+			  </section>
+
+        <section>
+          <pre><code>
+world=# explain (buffers, analyze) select * from city;
+                     QUERY PLAN
+-------------------------------------------------------------------
+ Seq Scan on city  (cost=0.00..72.79 rows=4079 width=31)
+                   (actual time=13.135..16.141 rows=4079 loops=1)
+   Buffers: shared read=32
+ Total runtime: 17.421 ms
+          </code></pre>
+          <pre><code>
+world=# explain (buffers, analyze) select * from city;
+                     QUERY PLAN
+-------------------------------------------------------------------
+ Seq Scan on city  (cost=0.00..72.79 rows=4079 width=31)
+                   (actual time=0.009..0.476 rows=4079 loops=1)
+   Buffers: shared hit=32
+ Total runtime: 0.778 ms
+          </code></pre>
+          <p>This was more than 20 times difference for <strong>sequential scan</strong>.</p>
+			  </section>
+
+        <section>
+          <p>There is also file system cache controlled by the operating between `shared buffer` and physical disk access.</p>
+          <br/>
+          <p>Postgres caching is duplicating what operating system is already doing, but it's still worth having because Postgres have better knowledge about it's data access patterns, yet at the same time it has no knowledge about underlying file system layout.</p>
+			  </section>
+
+        <section>
+          <p>Updates produce dirty pages.</p>
+          <br/>
+          <p>These can't be simply discarded as clean pages, they need to be written to disk first.</p>
+          <br/>
+          <p>Dirty pages are written mostly by background process, it's called <code>checkpoint</code>.</p>
+          <br/>
+          <p>Checkpoints could produce huge IO spikes, but are designed to run over time to balance the writes so impact on performance is minimal.</p>
+			  </section>
+
+        <section>
+          <p>By default a checkpoint is defined to be distributed over half time until next run is scheduled.</p>
+          <br/>
+          <p>Operating System still cache writes to disk, so there may be small delays between postgres flush and physical write occuring.</p>
+          <br/>
+          <p>Amount of writes during checkpoint is partially dependent on shared buffers size.</p>
+          <br/>
+          <p>This can potentially limit scalability of memory cache under certain use cases</p>
+			  </section>
+
+        <section>
+          <p>Postgres keeps track of IO stats.</p>
+          <pre><code>
+world=# select * from pg_statio_user_tables where relname='city';
+-[ RECORD 1 ]---+-------
+relid           | 360517
+schemaname      | public
+relname         | city
+heap_blks_read  | 32
+heap_blks_hit   | 98
+idx_blks_read   | 4
+idx_blks_hit    | 2
+toast_blks_read | 0
+toast_blks_hit  | 0
+tidx_blks_read  | 0
+tidx_blks_hit   | 0
+          </code></pre>
+			  </section>
+
+        <section>
+          <h2>So what?</h2>
+          <p>Proper caching and disk organization can have huge impact on speed.</p>
+          <br/>
+          <p>But it's difficult to predict and almost impossible to replicate locally.</p>
+          <br/>
+          <p>It can take a lot of time to discover data access patterns before doing any fixes.</p>
+          <br/>
+          <p>It's much easier to design database with performance in mind upfront than fix existing one.</p>
+			  </section>
+      </section>
+      <section>
+        <p>There is much more to be found in the documentation.</p>
+        <br/>
+        <h2>Thank you</h2>
+      </section>
+			</div>
+	</div>
+	<script src="lib/js/head.min.js"></script>
+	<script src="js/reveal.min.js"></script>
+
+	<script>
+		// Required, even if empty.
+		Reveal.initialize({
+      dependencies: [
+        { src: 'plugin/highlight/highlight.js', async: true, callback: function() { hljs.initHighlightingOnLoad(); } },
+        { src: 'plugin/markdown/marked.js', condition: function() { return !!document.querySelector( '[data-markdown]' ); } },
+        { src: 'plugin/markdown/markdown.js', condition: function() { return !!document.querySelector( '[data-markdown]' ); } }
+      ],
+      history: true
+		});
+	</script>
+</body>
+</html>
