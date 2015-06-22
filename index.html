@@ -2,7 +2,7 @@
 <html lang="en">	
 <head>
 	<meta charset="utf-8">
-	<title>GHG SQL</title>
+	<title>Behind Postgres performance</title>
 	<link rel="stylesheet" href="css/reveal.min.css">
 	<link rel="stylesheet" href="css/theme/default.css" id="theme">	
 </head>
@@ -54,6 +54,8 @@ world=# explain select * from city;
           <p>In format of range.</p>
           <p>First number is startup cost</p>
           <p>Second number is cost to fetch all rows</p>
+
+          <small>(Press down arrow)</small>
 			  </section>
         <section>
           <p>Default settings</p>
@@ -186,9 +188,12 @@ world=# explain analyze select * from city c
                                            (actual time=0.009..0.123 rows=239 loops=1)
  Total runtime: 2.617 ms
           </code></pre>
+          <p><code>Hash Join</code> operation got terminated as soon as it fetched 1000 rows, even through the estimation was for 4079.</p>
+          <p>Not every kind of operation can be early terminated.</p>
 			  </section>
 
         <section>
+          <p>Postgres is aware when plans are expected to take only fraction of rows and will adjust it's choice.</p>
           <pre><code>
 world=# explain select * from city c inner join country cc on c.countrycode = cc.code limit 1;
                                          QUERY PLAN                                          
@@ -199,6 +204,7 @@ world=# explain select * from city c inner join country cc on c.countrycode = cc
          ->  Index Scan using country_pkey on country cc  (cost=0.14..0.17 rows=1 width=113)
                Index Cond: (code = c.countrycode)
           </code></pre>
+          <p>Because we need only 1 row Postgres has choosen very expensive plan, but with no startup costs it turns to be the best one for single row.</p>
 			  </section>
 			</section>
       <section>
@@ -211,6 +217,7 @@ world=# explain select * from city;
  Seq Scan on city  (cost=0.00..72.79 rows=4079 width=31)
           </code></pre>
           <p>Total number of rows can be found in <code>pg_class</code> table.</p>
+          <small>(Press down arrow)</small>
 			  </section>
 
         <section>
@@ -449,6 +456,7 @@ select sum(avg_width) from pg_stats where tablename = 'city';
 -----
   31
           </code></pre>
+          <small>(Press down arrow)</small>
 			  </section>
 
         <section>
@@ -639,9 +647,7 @@ tidx_blks_hit   | 0
           <br/>
           <p>But it's difficult to predict and almost impossible to replicate locally.</p>
           <br/>
-          <p>It can take a lot of time to discover data access patterns before doing any fixes.</p>
-          <br/>
-          <p>It's much easier to design database with performance in mind upfront than fix existing one.</p>
+          <p>It can take a lot of time to discover data access patterns before applying any fixes.</p>
 			  </section>
       </section>
       <section>
